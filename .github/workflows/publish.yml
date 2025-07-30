@@ -1,0 +1,68 @@
+name: Mirror scribe and Build Image
+on:
+  schedule:
+    - cron: '0 */48 * * *' # Every 48 hours
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/publish.yml'
+env:
+  UPSTREAM_REPO_URL: https://git.sr.ht/~edwardloveall/scribe
+jobs:
+  check-and-build:
+    name: Fetch upstream and build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Fetch upstream commit hash
+        id: upstream
+        run: |
+          commit_hash=$(git ls-remote "$UPSTREAM_REPO_URL" HEAD | cut -f1)
+          echo "commit-hash=$commit_hash" >> $GITHUB_OUTPUT
+          echo "Upstream commit: $commit_hash"
+      - name: Check if image exists in GHCR
+        id: check
+        run: |
+          if docker manifest inspect ghcr.io/${{ github.repository }}:${{ steps.upstream.outputs.commit-hash }} > /dev/null 2>&1; then
+            echo "build-needed=false" >> $GITHUB_OUTPUT
+            echo "Image already exists for commit ${{ steps.upstream.outputs.commit-hash }}"
+          else
+            echo "build-needed=true" >> $GITHUB_OUTPUT
+            echo "Image doesn't exist, build required"
+          fi
+      - name: Clone upstream repository at specific commit
+        if: steps.check.outputs.build-needed == 'true'
+        run: |
+          git clone "$UPSTREAM_REPO_URL" upstream-repo
+          cd upstream-repo
+          git checkout ${{ steps.upstream.outputs.commit-hash }}
+      - name: Prepare Docker build environment
+        if: steps.check.outputs.build-needed == 'true'
+        uses: docker/setup-buildx-action@v3
+      - name: Authenticate with GHCR
+        if: steps.check.outputs.build-needed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push Docker image
+        if: steps.check.outputs.build-needed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream-repo
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ steps.upstream.outputs.commit-hash }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Generate artifact attestation
+        if: steps.check.outputs.build-needed == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
